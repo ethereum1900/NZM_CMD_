@@ -53,9 +53,16 @@ pub struct TDConfig {
     pub hud_check_rect: [i32; 4],
     pub hud_wave_loop_rect: [i32; 4],
     pub safe_zone: [i32; 4],
+    // ✨ 新增: 结算确认检测区 (OCR 区域), 只有在此区域识别到结算字样才判定游戏结束
+    pub end_confirm_rect: [i32; 4],
     pub screen_width: f32,
     pub screen_height: f32,
 }
+
+// ✨ 新增: 结算/胜利/失败/通关画面特征关键字 (OCR 命中任一即确认游戏结束)
+const SETTLEMENT_KEYWORDS: [&str; 8] = [
+    "胜利", "失败", "通关", "结算", "战绩", "奖励", "再次挑战", "返回",
+];
 
 impl Default for TDConfig {
     fn default() -> Self {
@@ -63,6 +70,8 @@ impl Default for TDConfig {
             hud_check_rect: [262, 16, 389, 97],
             hud_wave_loop_rect: [344, 290, 548, 353],
             safe_zone: [200, 200, 1720, 880],
+            // ✨ 新增: 默认覆盖屏幕中央大片区域 (结算大字位于中央)
+            end_confirm_rect: [460, 100, 1460, 980],
             screen_width: 1920.0,
             screen_height: 1080.0,
         }
@@ -1058,6 +1067,27 @@ impl TowerDefenseApp {
         }
     }
 
+    // ✨ 新增: 结算确认 —— 只有检测到画面上真正的结算特征文字, 才判定游戏结束
+    //   (用于区分 "CG 过场动画/波次间隙 OCR 失败" 与 "真正的游戏结束")
+    fn check_settlement_text(&self) -> bool {
+        let rect = self.config.end_confirm_rect;
+        let text = self.nav.ocr_area(rect);
+        if text.is_empty() {
+            println!("(结算确认区 OCR 无文字)");
+            return false;
+        }
+        for kw in SETTLEMENT_KEYWORDS {
+            if text.contains(kw) {
+                let snippet: String = text.chars().take(60).collect();
+                println!("🏁 结算确认命中关键字 [{}]: 片段 [{}]", kw, snippet);
+                return true;
+            }
+        }
+        let snippet: String = text.chars().take(60).collect();
+        println!("(结算确认区 OCR 无特征字样: [{}])", snippet);
+        false
+    }
+
     pub fn run(&mut self, terrain_p: &str, strategy_p: &str, trap_p: &str) {
         self.load_map_terrain(terrain_p);
         self.load_trap_config(trap_p);
@@ -1132,52 +1162,44 @@ impl TowerDefenseApp {
                     self.execute_wave_phase(current_wave, true);
                 }
             } else {
-                // === 情况 B: 未检测到波次 (可能是结算界面) ===
+                // === 情况 B: 未检测到波次 (可能是 CG 过场 / 结算界面) ===
                 no_wave_count += 1;
                 println!(
                     "⚠️ [Monitor] 未检测到波次信息 ({}/2)",
                     no_wave_count
                 );
 
-                // 连续2次未检测到波次，才尝试跳过结算
+                // 连续2次未检测到波次，开始跳过动画/结算
+                // ✨ 修改: 这里只按空格推进跳过 (CG 过场也会导致波次 HUD 消失),
+                //    不再以 "跳过次数" 直接判定结束 —— 必须用 check_settlement_text 得到
+                //    肯定性证据, 防止第 9 关 CG 动画期间被误判结算导致中途退出、卡死视角
                 if no_wave_count >= 2 {
                     skip_count += 1;
-                    println!(
-                        "   -> 第 {} 次跳过结算 (共需3次)",
-                        skip_count
-                    );
 
                     if let Ok(mut d) = self.driver.lock() {
-                        println!("   -> 点击空格 (Space) + 双击 ESC");
+                        println!("   -> 第 {} 次尝试跳过 (空格)", skip_count);
+                        // 双击空格: 跳过 CG / 快进结算动画
+                        d.key_click(' ');
+                        thread::sleep(Duration::from_millis(400));
+                        d.key_click(' ');
+                    }
 
-                        // 直接操作底层设备发送 HID 码 0x29 (ESC)
-                        if let Ok(mut dev) = d.device.lock() {
-                            // 第一次 ESC
-                            dev.key_down(0x29, 0);
-                            thread::sleep(Duration::from_millis(100)); // 按下持续时间
-                            dev.key_up();
-
-                            thread::sleep(Duration::from_millis(300)); // 两次按键间隔
+                    if skip_count >= 3 {
+                        // 正式确认: OCR 结算界面的特征文字
+                        if self.check_settlement_text() {
+                            println!("🏁 已检测到结算界面，判定为游戏结束。");
+                            println!("🔄 退出当前循环，返回主程序...");
+                            break;
                         }
 
-                        // 点击空格 (跳过结算动画)
-                        d.key_click(' ');
-                        thread::sleep(Duration::from_millis(500));
-
-                        if let Ok(mut dev) = d.device.lock() {
-                            // 第二次 ESC
-                            dev.key_down(0x29, 0);
-                            thread::sleep(Duration::from_millis(100));
-                            dev.key_up();
+                        // ✨ 兜底: 万一 OCR 始终识别不出来 (黑屏/字体异常), 超 3 分钟
+                        //    仍无波次才强制退出, 避免无限卡死
+                        if skip_count >= 18 {
+                            println!("⏱️ 连续 18 次无波次且未检出结算文字 (约3分钟)，强制判定结束。");
+                            println!("🔄 退出当前循环，返回主程序...");
+                            break;
                         }
                     }
-                }
-
-                // 连续3次跳过结算后，判定为游戏结束
-                if skip_count >= 3 {
-                    println!("🏁 连续 3 次跳过结算，判定为游戏结束。");
-                    println!("🔄 退出当前循环，返回主程序...");
-                    break;
                 }
             }
 
