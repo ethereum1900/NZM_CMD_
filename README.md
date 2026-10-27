@@ -189,6 +189,19 @@ cd tool
 cargo run --release
 
 ```
+###
+# 方式 A: 重编译后进交互模式输入(推荐)
+cargo build --release
+cargo run --release -- -p SOFT
+> td 空间站普通 loop      # 无限连刷,Ctrl+C 随时停
+> td 空间站普通 10        # 刷 10 局自动停
+
+# 方式 B: 一键脚本无限刷(把 test.ps1 最后一行改成这个)
+cargo run -- -p SOFT -t 空间站普通 -m loop
+
+# 方式 C: 只执行一次后退出
+cargo run --release -- -p SOFT -t 空间站普通 -m once
+
 
 ---
 

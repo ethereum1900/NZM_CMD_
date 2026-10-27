@@ -28,8 +28,12 @@ struct Args {
     #[arg(short, long, default_value = "COM3")]
     port: String,
 
-    #[arg(short, long, default_value = "loop")]
+    #[arg(short = 'm', long, default_value = "loop")]
     mode: RunMode,
+
+    // ✨ 恢复 -t 参数：支持 .bat 脚本一键启动 (如: -t 空间站普通)
+    #[arg(short, long)]
+    target: Option<String>,
 
     #[arg(long)]
     test: Option<String>,
@@ -119,12 +123,40 @@ fn main() {
         return;
     }
 
+    // ✨ 新增：命令行直连模式 (供 .bat / .ps1 一键启动使用, 不进入交互界面)
+    //   -t 空间站普通 -m loop  => 无限连刷
+    //   -t 空间站普通 -m once  => 只执行一次后退出
+    //   -m daily              => 忽略 target, 执行每日任务闭环
+    if let Some(target) = args.target.clone() {
+        match args.mode {
+            RunMode::Loop => {
+                println!("♾️ [循环模式] 目标: [{}]，将不断重复执行，按 Ctrl+C 停止", target);
+                let mut round = 0usize;
+                loop {
+                    round += 1;
+                    println!("\n🔁 ========== [{}] 第 {} 局 ==========", target, round);
+                    execute_target(&target, Arc::clone(&human_driver), Arc::clone(&engine));
+                    println!("💤 休整 5 秒后自动开始下一局...");
+                    thread::sleep(Duration::from_secs(5));
+                }
+            }
+            RunMode::Once => {
+                execute_target(&target, Arc::clone(&human_driver), Arc::clone(&engine));
+            }
+            RunMode::Daily => {
+                execute_daily(Arc::clone(&human_driver), Arc::clone(&engine));
+            }
+        }
+        return;
+    }
+
     println!("✅ 引擎就绪，进入交互模式");
     println!("========================================");
     println!("📋 可用命令:");
     println!("   <目标名称>  - 导航并执行目标 (如: 空间站英雄)");
     println!("   daily       - 执行每日任务 (自动检测塔防)");
-    println!("   td <地图>   - 执行塔防 (如: td 空间站英雄)");
+    println!("   td <地图>   - 执行塔防 (如: td 空间站普通)");
+    println!("                 支持连刷: td 空间站普通 10 / td 空间站普通 loop");
     println!("   tasks       - 查看任务列表");
     println!("   run         - 执行到期任务");
     println!("   daemon      - 启动守护模式 (自动执行任务)");
@@ -158,7 +190,7 @@ fn main() {
                 println!("📋 可用命令:");
                 println!("   <目标名称>  - 导航并执行目标");
                 println!("   daily       - 执行每日任务");
-                println!("   td <地图>   - 执行塔防");
+                println!("   td <地图>   - 执行塔防 (可加次数或 loop 连刷)");
                 println!("   tasks       - 查看任务列表");
                 println!("   run         - 执行到期任务");
                 println!("   daemon      - 启动守护模式");
@@ -230,14 +262,23 @@ fn main() {
                 execute_daily(Arc::clone(&human_driver), Arc::clone(&engine));
             }
             "td" => {
-                if parts.len() > 1 {
-                    let target = parts[1..].join(" ");
-                    println!("⏳ 1秒后执行...");
-                    thread::sleep(Duration::from_secs(1));
-                    execute_td(&target, Arc::clone(&human_driver), Arc::clone(&engine));
-                } else {
-                    println!("❌ 用法: td <地图名称>");
-                    println!("   示例: td 空间站英雄");
+                // ✨ 支持: td <地图>          -> 执行 1 局
+                //        td <地图> <次数>    -> 连刷 N 局
+                //        td <地图> loop      -> 无限连刷 (Ctrl+C 停止)
+                let (target_opt, count) = parse_td_args(&parts[1..]);
+                match target_opt {
+                    Some(target) => {
+                        println!("⏳ 1秒后执行...");
+                        thread::sleep(Duration::from_secs(1));
+                        run_td_rounds(&target, count, Arc::clone(&human_driver), Arc::clone(&engine));
+                    }
+                    None => {
+                        println!("❌ 用法: td <地图名称> [次数|loop]");
+                        println!("   示例:");
+                        println!("    td 空间站普通        -> 执行 1 局");
+                        println!("    td 空间站普通 10     -> 连刷 10 局");
+                        println!("    td 空间站普通 loop   -> 无限连刷 (Ctrl+C 停止)");
+                    }
                 }
             }
             _ => {
@@ -318,6 +359,47 @@ fn execute_td(target: &str, driver: Arc<Mutex<HumanDriver>>, engine: Arc<NavEngi
         NavResult::Failed => {
             println!("❌ [TD] 导航失败");
         }
+    }
+}
+
+// ✨ 新增: 解析 td 命令参数, 返回 (目标地图, 循环次数)
+//   "空间站普通"      -> (Some("空间站普通"), 1)
+//   "空间站普通 5"    -> (Some("空间站普通"), 5)
+//   "空间站普通 loop" -> (Some("空间站普通"), 0)   0 = 无限
+fn parse_td_args(parts: &[&str]) -> (Option<String>, usize) {
+    if parts.is_empty() {
+        return (None, 1);
+    }
+    let last = parts[parts.len() - 1];
+    let (count, core): (usize, &[&str]) = if last.eq_ignore_ascii_case("loop") || last == "无限" {
+        (0, &parts[..parts.len() - 1])
+    } else if let Ok(n) = last.parse::<usize>() {
+        (n, &parts[..parts.len() - 1])
+    } else {
+        (1, parts)
+    };
+    (Some(core.join(" ")), count)
+}
+
+// ✨ 新增: 连刷循环。count = 0 表示无限循环, 否则执行 count 局后停止
+fn run_td_rounds(target: &str, count: usize, driver: Arc<Mutex<HumanDriver>>, engine: Arc<NavEngine>) {
+    let mut round = 0usize;
+    loop {
+        round += 1;
+        if count == 0 {
+            println!("\n🔁 ===== [TD] 第 {} 局 (无限循环模式) =====", round);
+        } else {
+            println!("\n🔁 ===== [TD] 第 {}/{} 局 =====", round, count);
+        }
+
+        execute_td(target, Arc::clone(&driver), Arc::clone(&engine));
+
+        if count != 0 && round >= count {
+            println!("🏁 已完成 {} 局，连刷结束", round);
+            break;
+        }
+        println!("💤 休整 5 秒后自动开始下一局 (Ctrl+C 可随时停止)...");
+        thread::sleep(Duration::from_secs(5));
     }
 }
 
