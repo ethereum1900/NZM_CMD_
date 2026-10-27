@@ -190,6 +190,7 @@ cargo run --release
 
 ```
 ###
+```
 # 方式 A: 重编译后进交互模式输入(推荐)
 cargo build --release
 cargo run --release -- -p SOFT
@@ -201,7 +202,7 @@ cargo run -- -p SOFT -t 空间站普通 -m loop
 
 # 方式 C: 只执行一次后退出
 cargo run --release -- -p SOFT -t 空间站普通 -m once
-
+```
 
 ---
 
